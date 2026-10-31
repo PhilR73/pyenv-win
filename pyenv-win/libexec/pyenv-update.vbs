@@ -72,6 +72,58 @@ Function CopyDictionary(dict)
     Next
 End Function
 
+Function ResolveURL(ByVal baseURL, ByVal href)
+    Dim resolved
+    resolved = Trim(href)
+    If Len(resolved) = 0 Then
+        ResolveURL = ""
+        Exit Function
+    End If
+
+    If InStr(1, resolved, "://", vbTextCompare) > 0 Then
+        ResolveURL = resolved
+        Exit Function
+    End If
+
+    If Left(resolved, 1) = "/" Then
+        Dim scheme, host, pathPos
+        scheme = Left(baseURL, InStr(1, baseURL, "://", vbTextCompare) + 2)
+        host = Mid(baseURL, Len(scheme) + 1)
+        pathPos = InStr(1, host, "/", vbTextCompare)
+        If pathPos > 0 Then host = Left(host, pathPos - 1)
+        ResolveURL = scheme & host & resolved
+        Exit Function
+    End If
+
+    If Right(baseURL, 1) <> "/" Then baseURL = baseURL & "/"
+    ResolveURL = baseURL & resolved
+End Function
+
+Function StripHTMLText(ByVal htmlText)
+    Dim re
+    Set re = New RegExp
+    re.Pattern = "<[^>]+>"
+    re.Global = True
+    re.IgnoreCase = True
+    StripHTMLText = re.Replace(htmlText, " ")
+    StripHTMLText = Replace(StripHTMLText, vbTab, " ")
+    StripHTMLText = Replace(StripHTMLText, vbCr, " ")
+    StripHTMLText = Replace(StripHTMLText, vbLf, " ")
+    Do While InStr(1, StripHTMLText, "  ", vbTextCompare) > 0
+        StripHTMLText = Replace(StripHTMLText, "  ", " ")
+    Loop
+    StripHTMLText = Trim(StripHTMLText)
+End Function
+
+Function AnchorMatches(ByVal htmlText)
+    Dim re
+    Set re = New RegExp
+    re.Pattern = "<a\s+[^>]*href\s*=\s*(?:""([^""]+)""|'([^']+)'|([^""'\s>]+))[^>]*>(.*?)</a>"
+    re.Global = True
+    re.IgnoreCase = True
+    Set AnchorMatches = re.Execute(htmlText)
+End Function
+
 Sub UpdateDictionary(dict1, dict2)
     Dim key
     For Each key In dict2.Keys
@@ -84,8 +136,11 @@ Sub UpdateDictionary(dict1, dict2)
 End Sub
 
 Function ScanForVersions(URL, optIgnore, ByRef pageCount)
-    Dim objHTML
-    Set objHTML = CreateObject("htmlfile")
+    Dim pageText
+    Dim matches
+    Dim match
+    Dim href
+    Dim fileName
     Set ScanForVersions = CreateObject("Scripting.Dictionary")
 
     With objweb
@@ -104,23 +159,23 @@ Function ScanForVersions(URL, optIgnore, ByRef pageCount)
             WScript.Quit 1
         End If
 
-        objHTML.write .responseText
+        pageText = .responseText
         pageCount = pageCount + 1
     End With
-    EnsureBaseURL objHTML, URL
 
-    Dim link
-    Dim fileName
-    Dim matches
-    Dim major, minor, patch, rel
-    For Each link In objHTML.links
-        fileName = Trim(link.innerText)
+    For Each match In AnchorMatches(pageText)
+        href = match.SubMatches(0)
+        If Len(href) = 0 Then href = match.SubMatches(1)
+        If Len(href) = 0 Then href = match.SubMatches(2)
+        fileName = StripHTMLText(match.SubMatches(3))
+        If Len(fileName) = 0 Then fileName = objfs.GetFileName(href)
+
         Set matches = regexFile.Execute(fileName)
         If matches.Count = 1 Then
             ' Save as a dictionary entry with Key/Value as:
             '  -Key: [filename]
             '  -Value: Array([filename], [url], Array([regex submatches]))
-            ScanForVersions.Add fileName, Array(fileName, link.href, CollectionToArray(matches(0).SubMatches))
+            ScanForVersions.Add fileName, Array(fileName, ResolveURL(URL, href), CollectionToArray(matches(0).SubMatches))
         End If
     Next
 End Function
@@ -145,7 +200,12 @@ Sub main(arg)
     Set installers1 = CreateObject("Scripting.Dictionary")
 
     For Each mirror In mirrors
-        Set objHTML = CreateObject("htmlfile")
+        Dim responseText
+        Dim match
+        Dim linkCount
+        responseText = ""
+        linkCount = 0
+
         With objweb
             On Error Resume Next
             .Open "GET", mirror, False
@@ -169,18 +229,16 @@ Sub main(arg)
                 WScript.Quit 1
             End If
 
-            objHTML.write .responseText
+            responseText = .responseText
             pageCount = pageCount + 1
         End With
-        EnsureBaseURL objHTML, mirror
 
         Dim link
         Dim version
         Dim matches
-        If objHTML.links.Length = 0 Then
+        If InStr(1, responseText, "download_url", vbTextCompare) > 0 Then
             ' Assume we're dealing with JSON
-            Dim match
-            Set matches = regexJsonUrl.Execute(objHTML.body.innerHTML)
+            Set matches = regexJsonUrl.Execute(responseText)
             For Each match in matches
                 ' we matched: Array([url], [filename], [ziproot], [major], [minor], [patch], [x64], [ARM])
                 ' we need: Array([filename], [url], Array([major], [minor], [patch], [rel], [rel_num], [x64], [ARM], [webinstall], [ext], [ziproot]))
@@ -191,11 +249,14 @@ Sub main(arg)
                 )
             Next
         Else
-            For Each link In objHTML.links
-                version = objfs.GetFileName(link.pathname)
+            For Each match In AnchorMatches(responseText)
+                link = ResolveURL(mirror, match.SubMatches(0))
+                If Len(match.SubMatches(0)) = 0 Then link = ResolveURL(mirror, match.SubMatches(1))
+                If Len(match.SubMatches(0)) = 0 And Len(match.SubMatches(1)) = 0 Then link = ResolveURL(mirror, match.SubMatches(2))
+                version = objfs.GetFileName(link)
                 Set matches = regexVer.Execute(version)
                 If matches.Count = 1 Then _
-                    UpdateDictionary installers1, ScanForVersions(link.href, optIgnore, pageCount)
+                    UpdateDictionary installers1, ScanForVersions(link, optIgnore, pageCount)
             Next
         End If
     Next
